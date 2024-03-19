@@ -17,7 +17,7 @@ from deepspeed import comm as dist
 from deepspeed.utils import logger
 from .. import utils as ds_utils
 from ..activation_checkpointing import checkpointing
-from .topology import PipeDataParallelTopology, PipelineParallelGrid
+from .topology import PipeDataParallelTopology, PipelineParallelGrid, PipeDataExpertParallelTopology
 from deepspeed.runtime.state_dict_factory import SDLoaderFactory
 from deepspeed.accelerator import get_accelerator
 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
@@ -167,12 +167,20 @@ class PipelineModule(nn.Module):
             self.num_stages = self._topo.get_dim('pipe')
         else:
             self.num_stages = num_stages
-            if topology is None:
-                if self.world_size % self.num_stages != 0:
+            ep_size = 2 #FIXME: hard code for now
+            if ep_size == 1:
+                if self.world_size % num_stages != 0:
                     raise RuntimeError(
-                        f'num_stages ({self.num_stages}) must divide distributed world size ({self.world_size})')
+                        f'world size ({self.world_size}) must be divisible by num_stages ({num_stages})')
                 dp = self.world_size // num_stages
                 topology = PipeDataParallelTopology(num_pp=num_stages, num_dp=dp)
+                self._topo = topology
+            else:
+                if self.world_size % (num_stages * ep_size) != 0:
+                    raise RuntimeError(
+                        f'num_stages * ep_size ({self.num_stages * ep_size}) must be divisible by world size ({self.world_size})')
+                dp = self.world_size // (num_stages * ep_size)
+                topology = PipeDataExpertParallelTopology(num_pp=num_stages, num_dp=dp, num_ep=ep_size)
                 self._topo = topology
 
         # Construct communicators for pipeline topology

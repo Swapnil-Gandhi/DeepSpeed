@@ -491,6 +491,12 @@ class MOELayer(Base):
     def _set_ep_group(self, ep_group):
         self.ep_group = ep_group
 
+    def _get_ep_group(self):
+        if self.ep_group is None:
+            self.ep_group = groups._get_expert_parallel_group(self.ep_group_name)
+            assert self.ep_group is not None, f"Expert parallel group {self.ep_group_name} not found"
+        return self.ep_group
+
     def forward(self, *input: Tensor, **kwargs: Any) -> Tensor:
 
         if self.wall_clock_breakdown:
@@ -528,7 +534,7 @@ class MOELayer(Base):
             # reducing the all-to-all communication volume.
             dispatched_input = drop_tokens(dispatched_input, dim=1)
 
-        dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
+        dispatched_input = _AllToAll.apply(self._get_ep_group(), dispatched_input)
 
         if self.wall_clock_breakdown:
             self.timers(FIRST_ALLTOALL_TIMER).stop()
@@ -542,7 +548,7 @@ class MOELayer(Base):
         if self.wall_clock_breakdown:
             self.timers(SECOND_ALLTOALL_TIMER).start()
 
-        expert_output = _AllToAll.apply(self.ep_group, expert_output)
+        expert_output = _AllToAll.apply(self._get_ep_group(), expert_output)
 
         if self.wall_clock_breakdown:
             self.timers(SECOND_ALLTOALL_TIMER).stop()

@@ -131,6 +131,8 @@ class PipelineEngine(DeepSpeedEngine):
         self.is_pipe_parallel = self.grid.pipe_parallel_size > 1
         self.is_data_parallel = self.grid.data_parallel_size > 1
         self.is_model_parallel = self.grid.model_parallel_size > 1
+        self.is_expert_parallel = self.grid.expert_parallel_size > 1
+        logger.info(f'is_expert_parallel= {self.is_expert_parallel} ')
 
         # Partition input/output buffers
         # XXX temporarily disable while I revert some partition hacks.

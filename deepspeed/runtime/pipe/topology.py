@@ -5,6 +5,8 @@
 
 from deepspeed import comm as dist
 
+from deepspeed.utils import groups
+
 from collections import namedtuple
 from itertools import product as cartesian_product
 
@@ -124,7 +126,7 @@ class ProcessTopology:
                 return coord
         raise ValueError(f'rank {rank} not found in topology.')
 
-    def get_axis_comm_lists(self, axis):
+    def get_axis_comm_lists(self, axes):
         """ Construct lists suitable for a communicator group along axis ``axis``.
 
         Example:
@@ -141,24 +143,36 @@ class ProcessTopology:
             A list of lists whose coordinates match in all axes *except* ``axis``.
         """
 
-        # We don't want to RuntimeError because it allows us to write more generalized
-        # code for hybrid parallelisms.
-        if axis not in self.axes:
-            return []
+        if not isinstance(axes, list):
+            axes = [axes]
+        assert isinstance(axes, list), 'input_parameter: axes must be a list'
 
-        # Grab all axes but `axis`
-        other_axes = [a for a in self.axes if a != axis]
+        # We don't want to RuntimeError because it allows us to write more generalized
+        # code for hybrid parallelisms.     
+        selected_axes = []       
+        for axis in axes:
+            if axis in self.axes:
+                selected_axes.append(axis)
+            
+        if selected_axes == []:
+            return []
+        
+        # Grab all axes but ones in `selected_axes`
+        other_axes = [axis for axis in self.axes if axis not in selected_axes]
 
         lists = []
 
         # Construct all combinations of coords with other_axes
-        ranges = [range(self.get_dim(a)) for a in other_axes]
-        for coord in cartesian_product(*ranges):
+        selected_ranges = [range(self.get_dim(axis)) for axis in selected_axes]
+        other_ranges = [range(self.get_dim(a)) for a in other_axes]
+        for coord in cartesian_product(*other_ranges):
             other_keys = {a: coord[other_axes.index(a)] for a in other_axes}
-            # now go over all ranks in `axis`.
+            
+            # now go over all ranks in selected axes.
             sub_list = []
-            for axis_key in range(self.get_dim(axis)):
-                key = self.ProcessCoord(**other_keys, **{axis: axis_key})
+            for selected_coord in cartesian_product(*selected_ranges):
+                selected_keys = {axis: selected_coord[selected_axes.index(axis)] for axis in selected_axes}
+                key = self.ProcessCoord(**other_keys, **selected_keys)
                 sub_list.append(self.mapping[key])
             lists.append(sub_list)
 
@@ -248,6 +262,18 @@ class PipeModelDataParallelTopology(ProcessTopology):
         super().__init__(axes=['pipe', 'data', 'model'], dims=[num_pp, num_dp, num_mp])
 
 
+
+class PipeDataExpertParallelTopology(ProcessTopology):
+    """ A topology specialization for expert, data, and pipeline parallelism.
+
+        Uses expert parallelism on the last dimension to encourage gradient
+        reductions to use high-bandwidth intra-node links and lower-volume
+        pipeline communications to use low-bandwidth inter-node links.
+    """
+
+    def __init__(self, num_pp, num_dp, num_ep):
+        super().__init__(axes=['pipe', 'data', 'expert'], dims=[num_pp, num_dp, num_ep])
+
 class PipelineParallelGrid:
     """Implements a grid object that stores the data parallel ranks
     corresponding to each of the model parallel stages
@@ -291,6 +317,7 @@ class PipelineParallelGrid:
         self.data_parallel_size = max(self._topo.get_dim('data'), 1)
         self.pipe_parallel_size = max(self._topo.get_dim('pipe'), 1)
         self.model_parallel_size = max(self._topo.get_dim('model'), 1)
+        self.expert_parallel_size = max(self._topo.get_dim('expert'), 1)
         self.slice_parallel_size = self.model_parallel_size
         assert self._is_grid_valid(), "Invalid Grid"
 
@@ -316,7 +343,7 @@ class PipelineParallelGrid:
 
         # Create new ProcessGroup for gradient all-reduces - these are the data parallel groups
         self.dp_group = []
-        self.dp_groups = self._topo.get_axis_comm_lists('data')
+        self.dp_groups = self._topo.get_axis_comm_lists(['data', 'expert'])
         for g in self.dp_groups:
             proc_group = dist.new_group(ranks=g)
             if self.global_rank in g:
@@ -343,10 +370,6 @@ class PipelineParallelGrid:
         assert self.pp_proc_group is not None
 
         # Create new ProcessGroup for model (tensor-slicing) collectives
-
-        # Short circuit case without model parallelism.
-        # TODO: it would be nice if topology had bcast semantics to avoid this branching
-        # case?
         if self.model_parallel_size == 1:
             for group_rank in range(self.world_size):
                 group_rank = [group_rank]
@@ -354,7 +377,6 @@ class PipelineParallelGrid:
                 if group_rank[0] == self.global_rank:
                     self.slice_group = group_rank
                     self.slice_proc_group = group
-            return
         else:
             self.mp_group = []
             self.model_groups = self._topo.get_axis_comm_lists('model')
@@ -363,6 +385,50 @@ class PipelineParallelGrid:
                 if self.global_rank in g:
                     self.slice_group = g
                     self.slice_proc_group = proc_group
+
+        # Create new ProcessGroup for expert data parallel collectives - for experts,
+        #  all_reduce is performed using these groups
+        self.expert_dp_group = []
+        self.expert_dp_world_size = -1
+        self.expert_dp_proc_group = None
+
+        self.expert_dp_group = self._topo.get_axis_comm_lists(['data'])
+        for g in self.expert_dp_group:
+            proc_group = dist.new_group(ranks=g)
+            if self.global_rank in g:
+                self.expert_dp_group = g
+                self.expert_dp_world_size = len(g)
+                self.expert_dp_proc_group = proc_group
+
+        assert self.expert_dp_world_size > -1
+        assert self.expert_dp_proc_group is not None
+
+
+        # Create new ProcessGroup for expert collectives - for experts,
+        #   all_to_all communication is performed along these groups
+        self.ep_proc_group = None
+        if self.expert_parallel_size == 1:
+            for group_rank in range(self.world_size):
+                group_rank = [group_rank]
+                group = dist.new_group(ranks=group_rank)
+                if group_rank[0] == self.global_rank:
+                    self.ep_group = group_rank
+                    self.ep_proc_group = group
+        else:
+            self.ep_group = []
+            self.expert_groups = self._topo.get_axis_comm_lists('expert')
+            for g in self.expert_groups:
+                assert len(g) == self.expert_parallel_size
+                proc_group = dist.new_group(ranks=g)
+                if self.global_rank in g:
+                    self.ep_group = g
+                    self.ep_proc_group = proc_group
+        assert self.ep_proc_group is not None
+
+        # FIXME: Currenlty we create one expert group for each pipeline stage, but we should
+        #  create one expert group for each layer.
+        group_name = f"ep_size_{self.expert_parallel_size}"
+        groups._append_expert_and_data_parallel(group_name, self.ep_proc_group, self.expert_dp_proc_group)
 
     def get_stage_id(self):
         return self._topo.get_coord(rank=self.global_rank).pipe
@@ -454,3 +520,26 @@ class PipelineParallelGrid:
 
     def get_slice_parallel_group(self):
         return self.slice_proc_group
+    
+    # For MOE-style expert parallelism
+    def get_expert_parallel_rank(self):
+        if 'expert' in self._topo.get_axis_names():
+            return self._topo.get_coord(rank=self.global_rank).expert
+        else:
+            return 0
+
+    # TODO: Do we need this?
+    def get_expert_data_parallel_rank(self):
+        return NotImplementedError
+
+    def get_expert_parallel_world_size(self):
+        return self.expert_parallel_size
+
+    def get_expert_data_parallel_world_size(self):
+        return self.expert_dp_world_size
+
+    def get_expert_data_parallel_group(self):
+        return self.expert_dp_proc_group
+    
+    def get_expert_parallel_group(self):
+        return self.ep_proc_group

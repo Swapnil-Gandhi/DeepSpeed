@@ -110,6 +110,17 @@ def _create_model_parallel(model_parallel_size_):
     return _DATA_PARALLEL_GROUP, _MODEL_PARALLEL_GROUP
 
 
+def _append_expert_and_data_parallel(group_name, expert_parallel_group_, expert_data_parallel_group_):
+    
+    global _EXPERT_PARALLEL_GROUP
+    global _EXPERT_DATA_PARALLEL_GROUP
+
+    if group_name not in _EXPERT_PARALLEL_GROUP:
+        _EXPERT_PARALLEL_GROUP[group_name] = expert_parallel_group_
+
+    if group_name not in _EXPERT_PARALLEL_GROUP:
+        _EXPERT_DATA_PARALLEL_GROUP[group_name] = expert_data_parallel_group_
+
 def _create_expert_and_data_parallel(expert_parallel_size_, use_data_before_expert_parallel_=False):
     """
         Create expert and data parallel groups.
