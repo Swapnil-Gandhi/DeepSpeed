@@ -252,6 +252,7 @@ class DeepSpeedEngine(Module):
         self.num_experts = []
         self.gate_modules = []
         self.moe_layers = []
+        self.moevement_coordinator = None
         self._step_applied = False
         self._global_grad_norm = None
         self.use_ds_comm = False  # False --> Use torch.dist, True --> Use ds.comm backend.
@@ -1484,6 +1485,11 @@ class DeepSpeedEngine(Module):
                     self.moe_layers.append(module)
                     if self.wall_clock_breakdown():
                         module.wall_clock_breakdown = True
+
+        # Initialize MoEvement sparse checkpointing if enabled
+        if self.has_moe_layers and self._config.moevement_config.enabled:
+            from deepspeed.moevement import MoEvementCoordinator
+            self.moevement_coordinator = MoEvementCoordinator(self._config.moevement_config)
 
         # Pass the mpu from here to groups. For subsequent use, just query groups
         if self.mpu is not None:
@@ -2819,6 +2825,10 @@ class DeepSpeedEngine(Module):
 
         self.tput_timer.stop(global_step=self.is_gradient_accumulation_boundary(), report_speed=report_progress)
 
+        # MoEvement: trigger sparse snapshot after optimizer step
+        if self.moevement_coordinator is not None and self.is_gradient_accumulation_boundary():
+            self.moevement_coordinator.on_iteration_end(self.global_steps, self.module, self.optimizer)
+
         self._stop_timers(self.engine_timers.step_timers)
 
         # Log learning rate
@@ -3485,6 +3495,10 @@ class DeepSpeedEngine(Module):
         if self.load_universal_checkpoint() and not self.zero_optimization_partition_weights():
             self.optimizer.update_lp_params()
 
+        # Load MoEvement sparse checkpoint if available
+        if self.moevement_coordinator is not None and load_path is not None:
+            self.moevement_coordinator.load_sparse_checkpoint(load_dir, tag)
+
         return load_path, client_states
 
     def _load_checkpoint(self,
@@ -3792,6 +3806,10 @@ class DeepSpeedEngine(Module):
                                       tag,
                                       client_state=client_state,
                                       exclude_frozen_parameters=exclude_frozen_parameters)
+
+        # Save MoEvement sparse checkpoint alongside the regular checkpoint
+        if self.moevement_coordinator is not None:
+            self.moevement_coordinator.save_sparse_checkpoint(save_dir, tag)
 
         # We distribute the task of saving layer checkpoint files among
         # data parallel instances, so all procs should call _save_checkpoint.

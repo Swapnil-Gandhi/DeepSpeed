@@ -1028,6 +1028,10 @@ class PipelineEngine(DeepSpeedEngine):
 
         outputs = self.pipe_buffers['outputs'][buffer_id]
 
+        # MoEvement upstream logging: log activations at stage boundaries
+        if self.moevement_coordinator is not None:
+            self.moevement_coordinator.on_send_activations(outputs, self.global_steps, buffer_id, self.stage_id)
+
         # NCCL does not like to send torch.BoolTensor types, so cast the mask to half().
         # We could do char, but with half() we can eventually flatten with other fp16
         # messages (TODO)
@@ -1063,6 +1067,12 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers(PIPE_SEND_GRAD_TIMER).start()
 
         inputs = self.pipe_buffers['inputs'][buffer_id]
+
+        # MoEvement upstream logging: log gradients at stage boundaries
+        if self.moevement_coordinator is not None:
+            grad_tensor = inputs.grad if isinstance(
+                inputs, torch.Tensor) else inputs[0].grad if isinstance(inputs, tuple) else None
+            self.moevement_coordinator.on_send_gradients(grad_tensor, self.global_steps, buffer_id, self.stage_id)
 
         # Partition the gradient
         if self.is_grad_partitioned:

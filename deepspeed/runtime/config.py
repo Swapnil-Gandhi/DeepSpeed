@@ -58,6 +58,7 @@ from ..compression.config import get_compression_config, get_quantize_enabled
 from ..compression.constants import *
 from .swap_tensor.aio_config import get_aio_config
 from .model_checkpointing.config import get_checkpoint_config
+from ..moevement.config import get_moevement_config
 
 from .tensor_parallel import get_tensor_parallel_config
 from .data_pipeline.config import get_data_efficiency_enabled, get_data_efficiency_config, get_curriculum_enabled_legacy, get_curriculum_params_legacy
@@ -870,6 +871,8 @@ class DeepSpeedConfig(object):
 
         self.timers_config = get_timers_config(param_dict)
         self.tensor_parallel_config = get_tensor_parallel_config(param_dict)
+
+        self.moevement_config = get_moevement_config(param_dict)
 
     def _batch_assertion(self):
 
